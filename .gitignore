@@ -1,0 +1,7 @@
+# Ignore all model files and cache files in the Jeremy directory
+Jeremy/*.msh
+Jeremy/*.h5
+Jeremy/*.xdmf
+Jeremy/__pycache__/
+Jeremy/*.pyc
+Jeremy/*.vtu
