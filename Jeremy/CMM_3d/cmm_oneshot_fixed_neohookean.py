@@ -130,9 +130,14 @@ I1 = ufl.tr(C)
 
 # Neo-Hookean strain energy density
 # W = (μ/2)(I₁ - 3) + (κ/2)(ln J)²
-W_iso = 0.5 * mu * (I1 - 3.0)           # Isochoric part
-W_vol = 0.5 * kappa * ufl.ln(J)**2      # Volumetric part
-W_total = W_iso + W_vol
+def W_neohookean(I1, J, mu, kappa):
+    W_iso = 0.5 * mu * (I1 - 3.0)           # Isochoric part
+    W_vol = 0.5 * kappa * ufl.ln(J)**2      # Volumetric part
+    W_total = W_iso + W_vol
+    return W_total
+
+
+W_total = W_neohookean(I1, J, mu, kappa)
 
 
 # -----------------------------------------------------------------------------
@@ -281,4 +286,3 @@ plotter.show()
 with VTKFile(domain.comm, "neohookean_tube_results.vtu", "w") as f:
     f.write_mesh(domain)
     f.write_function(u)
-    

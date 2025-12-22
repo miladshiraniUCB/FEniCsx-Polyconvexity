@@ -136,15 +136,15 @@ beta_d     = fem.Constant(domain, PETSc.ScalarType(0.877))
 c_e  = fem.Constant(domain, PETSc.ScalarType(89.71 * kPa_to_N_per_mm2))
 
 # Fiber parameters (kPa)
-c1m = fem.Constant(domain, PETSc.ScalarType(6.939 * kPa_to_N_per_mm2))
-c2m = fem.Constant(domain, PETSc.ScalarType(4.442))
+c1m = fem.Constant(domain, PETSc.ScalarType(261.4 * kPa_to_N_per_mm2))
+c2m = fem.Constant(domain, PETSc.ScalarType(0.24))
 
-c1c = fem.Constant(domain, PETSc.ScalarType(14.04 * kPa_to_N_per_mm2))
-c2c = fem.Constant(domain, PETSc.ScalarType(0.6530))
+c1c = fem.Constant(domain, PETSc.ScalarType(234.9 * kPa_to_N_per_mm2))
+c2c = fem.Constant(domain, PETSc.ScalarType(4.08))
 
 # Deposition stretches (Table 1)
-Gm = fem.Constant(domain, PETSc.ScalarType(1.080))
-Gc = fem.Constant(domain, PETSc.ScalarType(1.130))
+Gm = fem.Constant(domain, PETSc.ScalarType(1.20))
+Gc = fem.Constant(domain, PETSc.ScalarType(1.25))
 Ge_theta = fem.Constant(domain, PETSc.ScalarType(1.900))
 Ge_z     = fem.Constant(domain, PETSc.ScalarType(1.62))
 Ge_r     = fem.Constant(domain, PETSc.ScalarType(1.0 / (float(Ge_theta.value) * float(Ge_z.value))))
@@ -153,7 +153,7 @@ Ge_r     = fem.Constant(domain, PETSc.ScalarType(1.0 / (float(Ge_theta.value) * 
 kappa = fem.Constant(domain, PETSc.ScalarType(1e1 * float(c_e.value)))
 
 # Pre-Jacobian shift JG = exp(-p0/kappa) (paper Stage I)
-JG = fem.Constant(domain, PETSc.ScalarType(np.exp(-float(p0.value) / float(kappa.value))))
+JG = fem.Constant(domain, PETSc.ScalarType(np.exp(-float(p0.value) / float(kappa.value)))) # page 15
 
 
 # -----------------------------------------------------------------------------
@@ -248,12 +248,30 @@ def W_elastin(Ce_):
 
 def W_fiber(I4, c1, c2):
     """
-    Eq (52)-type exponential fiber energy (tension-only).
-    The paper defines smooth muscle + collagen with an exponential on (I4-1)^2; we enforce tension-only.
+    Eq (52): Exponential fiber energy (tension-only).
+    
+    For smooth muscle and collagen families:
+        ψ^k = (c₁^k / (4c₂^k)) [exp(c₂^k E₄^k²) - 1]  if E₄^k > 0 (tension)
+        ψ^k = 0                                         if E₄^k ≤ 0 (compression)
+    
+    where E₄^k = I₄^k - 1 is the Green strain in fiber direction k.
+    
+    Args:
+        I4: Fourth invariant (a · C · a) for fiber family
+        c1, c2: Material parameters for exponential fiber response
     """
-    E = I4 - 1.0
-    # tension-only: no contribution in compression
-    return ufl.conditional(ufl.gt(I4, 1.0), (c1 / (4.0 * c2)) * (ufl.exp(c2 * E * E) - 1.0), 0.0)
+    E4 = I4 - 1.0  # Green strain in fiber direction
+    # Tension-only: fibers only resist stretch (E4 > 0 ⟺ I4 > 1)
+    W_tension = (c1 / (4.0 * c2)) * (ufl.exp(c2 * E4 * E4) - 1.0)
+    return ufl.conditional(ufl.gt(E4, 0.0), W_tension, 0.0)
+
+# Neo-Hookean strain energy density
+# W = (μ/2)(I₁ - 3) + (κ/2)(ln J)²
+def W_neohookean(I1, J, mu, kappa):
+    W_iso = 0.5 * mu * (I1 - 3.0)           # Isochoric part
+    W_vol = 0.5 * kappa * ufl.ln(J)**2      # Volumetric part
+    W_total = W_iso + W_vol
+    return W_total
 
 def fiber_invariant(a_, C_):
     """Helper to compute I4 = a . C . a"""
@@ -276,8 +294,8 @@ Wc = (beta_theta * W_fiber(I4ct, c1c, c2c) +
 lnJ = ufl.ln(J * JG)
 U_vol = 0.5 * kappa * lnJ * lnJ
 
-# W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
-W_total = 0.5 * W_elastin(Ce) + 0.5 * Wm + U_vol
+W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
+# W_total =  0.3 * W_elastin(Ce) + 0.7 * W_neohookean(ufl.tr(C), J, mu=c_e, kappa=kappa) + U_vol
 # W_total = Wm # + U_vol
 # W_total = Wc # + U_vol
 
@@ -336,7 +354,7 @@ petsc_options = {
     "snes_atol": 1e-5, # Stop when the absolute residual drops below 10⁻⁹ (i.e., residual norm < 0.000000001)
     "snes_max_it": 250, # Maximum nonlinear iterations before giving up
     "snes_monitor": None, # Print residual norm at each iteration (helps debug convergence)
-    "snes_error_if_not_converged": True, # Raise error if not converged
+    "snes_error_if_not_converged": False, # Raise error if not converged
     "snes_linesearch_type": "bt",   # Use backtracking line search to ensure Newton steps decrease the residual
     "snes_linesearch_monitor": None, # Print line search details at each step
     
