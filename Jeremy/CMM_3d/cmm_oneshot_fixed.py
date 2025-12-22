@@ -61,7 +61,8 @@ import pyvista as pv
 
 def _normalize(v, eps=1e-12):
     """UFL-safe normalization with a small epsilon."""
-    return v / ufl.sqrt(ufl.dot(v, v) + eps)
+    eps_ufl = ufl.as_ufl(eps)
+    return v / ufl.sqrt(ufl.dot(v, v) + eps_ufl)
 
 
 def cylindrical_basis(X):
@@ -200,38 +201,74 @@ def read_fiber_data(path, comm):
 comm = MPI.COMM_WORLD
 rank = comm.rank
 
-mesh_file = "tube_mesh.xdmf"
-# mesh_file = "tube_mesh.msh"
-domain = read_mesh(mesh_file)
+# mesh_file = "tube_mesh.xdmf"
+# # mesh_file = "tube_mesh.msh"
+# domain = read_mesh(mesh_file)
+
+
+
+
+from tube_mesh_vol2 import tube_mesh_to_dolfinx_model, generate_tube_volume_mesh
+
+alpha0_deg = 29.91  # degrees
+alpha0 = alpha0_deg * np.pi / 180.0  # radians
+
+mesh = generate_tube_volume_mesh(
+    axial_length=10.0, # [mm]
+    lumen_diameter=1.294, # [mm]
+    wall_thickness=0.25, # [mm]
+    n_axial=50,
+    n_circ=36,
+    n_radial=4,
+    axis="z",
+    mesh_type="hex8",  # Options: 'tet4', 'tet10', 'hex8', 'hex20'
+    fiber_angles={
+        "theta": np.pi / 2,  # circumferential
+        "axial": 0.0,  # axial
+        "diagonal1": alpha0,  # +alpha
+        "diagonal2": -alpha0,  # -alpha
+    },
+)
+
+model = tube_mesh_to_dolfinx_model(mesh)
+
+domain = model.mesh
+facet_tags = model.facet_tags
+fiber_functions = model.fibers
+
+
+
+
+
 
 tdim = domain.topology.dim
 fdim = tdim - 1
 domain.topology.create_connectivity(fdim, tdim)
 
-# Boundary facet tags
-facet_tags = None
-boundary_file = "tube_mesh_boundary.xdmf"
-# boundary_file = "tube_mesh_boundary.msh"
-try:
-    facet_tags = read_meshtags(boundary_file, domain)
-    if rank == 0:
-        print(f"Loaded facet tags from {boundary_file}; unique tags: {np.unique(facet_tags.values)}")
-except Exception as e:
-    if rank == 0:
-        print(f"WARNING: Could not read boundary tags: {e}")
-        print("         Proceeding without tags will fail unless you add geometric markers.")
+# # Boundary facet tags
+# facet_tags = None
+# boundary_file = "tube_mesh_boundary.xdmf"
+# # boundary_file = "tube_mesh_boundary.msh"
+# try:
+#     facet_tags = read_meshtags(boundary_file, domain)
+#     if rank == 0:
+#         print(f"Loaded facet tags from {boundary_file}; unique tags: {np.unique(facet_tags.values)}")
+# except Exception as e:
+#     if rank == 0:
+#         print(f"WARNING: Could not read boundary tags: {e}")
+#         print("         Proceeding without tags will fail unless you add geometric markers.")
 
-# Fiber/basis data (DG0 vectors on cells)
-fiber_functions = {}
-fiber_file = "tube_mesh_fibers.xdmf"
-# fiber_file = "tube_mesh_fibers.msh"
-try:
-    fiber_data = read_fiber_data(fiber_file, comm)
-    fiber_functions = build_DG0_vector_functions(domain, fiber_data)
-except Exception as e:
-    if rank == 0:
-        print(f"WARNING: Could not read fiber data: {e}")
-        print("         Will use analytic cylindrical fallback directions.")
+# # Fiber/basis data (DG0 vectors on cells)
+# fiber_functions = {}
+# fiber_file = "tube_mesh_fibers.xdmf"
+# # fiber_file = "tube_mesh_fibers.msh"
+# try:
+#     fiber_data = read_fiber_data(fiber_file, comm)
+#     fiber_functions = build_DG0_vector_functions(domain, fiber_data)
+# except Exception as e:
+#     if rank == 0:
+#         print(f"WARNING: Could not read fiber data: {e}")
+#         print("         Will use analytic cylindrical fallback directions.")
 
 
 # -----------------------------------------------------------------------------

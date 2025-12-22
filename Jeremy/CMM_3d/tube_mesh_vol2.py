@@ -1,5 +1,6 @@
+from dataclasses import dataclass
 import numpy as np
-from typing import Literal, Dict
+from typing import Literal, Dict, Any, Optional
 import pyvista as pv
 import meshio
 
@@ -15,8 +16,8 @@ def generate_tube_volume_mesh(
     n_radial: int,
     axis: AxisType = "z",
     mesh_type: MeshType = "hex8",
-    fiber_angles: Dict[str, float] = None,
-) -> Dict[str, np.ndarray]:
+    fiber_angles: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
     """
     Generate a volumetric mesh of a cylindrical tube (pipe).
 
@@ -439,6 +440,144 @@ def generate_tube_volume_mesh(
         "boundary_tags": boundary_tags,
     }
 
+@dataclass
+class DolfinxTubeModel:
+    mesh: "object"
+    cell_tags: "object"
+    facet_tags: "object"
+    fibers: Dict[str, "object"]  # name -> dolfinx.fem.Function
+
+
+def tube_mesh_to_dolfinx_model(
+    mesh_dict: dict,
+    comm=None,
+    rank: int = 0,
+) -> DolfinxTubeModel:
+    """
+    Convert the returned mesh dict into a dolfinx mesh + MeshTags, and attach fiber vectors
+    as DG0 vector Functions (one per fiber family).
+
+    Implementation note:
+      We rebuild a discrete gmsh model in-memory and use gmshio.model_to_mesh, which
+      avoids having to guess dolfinx/basix node ordering for higher-order cells.
+
+    Returns:
+      DolfinxTubeModel(mesh, cell_tags, facet_tags, fibers)
+    """
+    from mpi4py import MPI
+    import gmsh
+    from dolfinx.io import gmsh as gmshio
+    from dolfinx import fem
+
+    if comm is None:
+        comm = MPI.COMM_WORLD
+
+    # --- Broadcast mesh_dict (lightweight approach) ---
+    # If you already have mesh_dict on all ranks, this is still OK.
+    mesh_dict = comm.bcast(mesh_dict if comm.rank == rank else None, root=rank)
+
+    nodes = mesh_dict["nodes"]
+    elements = mesh_dict["elements"]
+    element_type = mesh_dict["element_type"]
+    order = int(mesh_dict["element_order"])
+    bfaces = mesh_dict["boundary_faces"]
+    btags = mesh_dict["boundary_tags"]
+    fiber_families = mesh_dict["fiber_families"]
+
+    gmsh_vol_type = {
+        "tet4": 4,
+        "tet10": 11,
+        "hex8": 5,
+        "hex20": 17,
+    }[element_type]
+    cell_kind = "tet" if element_type.startswith("tet") else "hex"
+    gmsh_facet_type = (2 if order == 1 else 9) if cell_kind == "tet" else (3 if order == 1 else 16)
+
+    faces_by_tag: Dict[int, np.ndarray] = {}
+    for tag in (1, 2, 3, 4):
+        faces_by_tag[tag] = bfaces[btags == tag]
+
+    # Build gmsh model on root only
+    if comm.rank == rank:
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("walled_tube")
+
+        for s in (1, 2, 3, 4):
+            gmsh.model.addDiscreteEntity(2, s)
+        gmsh.model.addDiscreteEntity(3, 1, [1, 2, 3, 4])
+
+        gmsh.model.addPhysicalGroup(3, [1], 1)
+        for s in (1, 2, 3, 4):
+            gmsh.model.addPhysicalGroup(2, [s], s)
+
+        N = nodes.shape[0]
+        node_tags = np.arange(1, N + 1, dtype=np.int64)
+        gmsh.model.mesh.addNodes(3, 1, node_tags.tolist(), nodes.reshape(-1).tolist())
+
+        M = elements.shape[0]
+        elem_tags = np.arange(1, M + 1, dtype=np.int64)
+        gmsh.model.mesh.addElements(
+            3, 1,
+            [gmsh_vol_type],
+            [elem_tags.tolist()],
+            [(elements + 1).astype(np.int64).reshape(-1).tolist()]
+        )
+
+        next_tag = int(elem_tags[-1]) + 1
+        for s in (1, 2, 3, 4):
+            F = faces_by_tag[s]
+            if F.size == 0:
+                continue
+            K = F.shape[0]
+            face_tags = np.arange(next_tag, next_tag + K, dtype=np.int64)
+            next_tag += K
+            gmsh.model.mesh.addElements(
+                2, s,
+                [gmsh_facet_type],
+                [face_tags.tolist()],
+                [(F + 1).astype(np.int64).reshape(-1).tolist()]
+            )
+
+    # Convert to dolfinx mesh (+ tags)
+    mesh_data = gmshio.model_to_mesh(gmsh.model, comm, rank, gdim=3)
+    domain = mesh_data.mesh
+    cell_tags = mesh_data.cell_tags
+    facet_tags = mesh_data.facet_tags
+
+    if comm.rank == rank:
+        gmsh.finalize()
+
+    # Attach fiber families as DG0 vector functions
+    V = fem.functionspace(domain, ("DG", 0, (domain.geometry.dim,)))
+    fibers_out: Dict[str, fem.Function] = {}
+
+    # We assume the cell ordering matches the order we inserted elements (tags 1..M),
+    # and that gmshio distributes cells in contiguous ranges of the global ordering.
+    # This is typically true for model_to_mesh in dolfinx.
+    imap = domain.topology.index_map(domain.topology.dim)
+    lo, hi = imap.local_range  # global cell index range owned by this rank
+
+    for name, fvec_global in fiber_families.items():
+        fvec_global = np.asarray(fvec_global, dtype=float)
+        f_local = fvec_global[lo:hi]  # (n_local_cells, 3)
+
+        fn = fem.Function(V)
+        # DG0 vector: one vector value per cell (owned cells are first in local numbering)
+        # fn.x.array is flat, size = (num_local_cells + num_ghosts) * gdim
+        # Fill owned part; leave ghosts as 0 (can be updated by scatter_forward if needed).
+        gdim = domain.geometry.dim
+        owned = hi - lo
+        fn.x.array[: owned * gdim] = f_local.reshape(-1)
+        fn.x.scatter_forward()
+        fibers_out[name] = fn
+
+    return DolfinxTubeModel(mesh=domain, cell_tags=cell_tags, facet_tags=facet_tags, fibers=fibers_out)
+
+
+
+
+
 
 if __name__ == "__main__":
     # Fiber families for constrained mixture model
@@ -464,6 +603,10 @@ if __name__ == "__main__":
             "diagonal2": -alpha0,  # -alpha
         },
     )
+
+    # Build an in-memory dolfinx model
+    model = tube_mesh_to_dolfinx_model(mesh)
+    print(model.mesh, model.facet_tags, list(model.fibers.keys()))
 
     nodes = mesh["nodes"]
     cells = mesh["elements"]
@@ -520,11 +663,13 @@ if __name__ == "__main__":
             geom=pv.Arrow()
         )
         
-        plotter.add_mesh(arrows, color=color, label=f"Fiber: {family_name}")
+        # Cast to PolyData to satisfy type checker
+        if isinstance(arrows, pv.PolyData):
+            plotter.add_mesh(arrows, color=color, label=f"Fiber: {family_name}")
     
-    plotter.add_legend()
-    plotter.add_axes()
-    # plotter.show()
+    # plotter.add_legend()  # Legend is automatically added when labels are provided
+    # plotter.add_axes()
+    plotter.show()
 
     # Write mesh to XDMF format - separate files for mesh, boundaries, and fibers
     meshio_cell_type = {
