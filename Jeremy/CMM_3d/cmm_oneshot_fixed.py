@@ -54,161 +54,16 @@ from dolfinx.plot import vtk_mesh
 from petsc4py import PETSc
 import pyvista as pv
 
+from tube_mesh_vol2 import tube_mesh_to_dolfinx_model, generate_tube_volume_mesh
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
-def _normalize(v, eps=1e-12):
-    """UFL-safe normalization with a small epsilon."""
-    eps_ufl = ufl.as_ufl(eps)
-    return v / ufl.sqrt(ufl.dot(v, v) + eps_ufl)
-
-
-def cylindrical_basis(X):
-    """
-    Analytic cylindrical basis (axis = global z) computed from SpatialCoordinate.
-    Used as robust fallback if basis vectors are not found in the fiber file.
-    """
-    x, y, z = X[0], X[1], X[2]
-    r = ufl.sqrt(x*x + y*y + 1e-16)
-    e_r = ufl.as_vector((x/r, y/r, 0.0))
-    e_theta = ufl.as_vector((-y/r, x/r, 0.0))
-    e_z = ufl.as_vector((0.0, 0.0, 1.0))
-    return e_r, e_theta, e_z
-
-
-def read_cell_vector_fields_from_xdmf_h5(fiber_xdmf, comm):
-    """
-    Read meshio-written cell-data vectors (shape [num_cells_global, 3]) from the .h5 referenced by the XDMF.
-
-    This mimics your original parsing approach, but we keep it here as a compact utility.
-    """
-    import re
-    import h5py
-    fiber_data = {}
-
-    h5_path = fiber_xdmf.replace(".xdmf", ".h5")
-    with open(fiber_xdmf, "r") as f:
-        xdmf_txt = f.read()
-
-    # match Attribute Name="fiber_<something>"
-    fiber_names = re.findall(r'<Attribute Name="(fiber_\w+)"', xdmf_txt)
-    if comm.rank == 0:
-        print(f"Found fiber/basis attributes in {fiber_xdmf}: {fiber_names}")
-
-    with h5py.File(h5_path, "r") as h5:
-        for name in fiber_names:
-            # find the DataItem that points to the dataset
-            # example: tube_mesh_fibers.h5:/data0
-            pattern = rf'<Attribute Name="{name}".*?>(.*?)</Attribute>'
-            attr_match = re.search(pattern, xdmf_txt, re.DOTALL)
-            if attr_match is None:
-                continue
-            data_match = re.search(r'>([^<]+\.h5:[^<]+)</DataItem>', attr_match.group(1))
-            if data_match is None:
-                continue
-            dataset_path = data_match.group(1).split(":")[1]
-            arr = np.array(h5[dataset_path])
-            fiber_data[name] = arr
-            if comm.rank == 0:
-                print(f"  Loaded {name}: {arr.shape}")
-    return fiber_data
-
-
-def build_DG0_vector_functions(domain, fiber_data):
-    """
-    Map global cell-data arrays -> DG0 vector Functions (one vector per cell).
-    Includes ghost cells and scatter_forward() for parallel correctness.  (FIX 6)
-    """
-    comm = domain.comm
-    rank = comm.rank
-    dim = domain.geometry.dim
-
-    DG0v = fem.functionspace(domain, ("DG", 0, (dim,)))
-    cell_imap = domain.topology.index_map(domain.topology.dim)
-
-    n_local = cell_imap.size_local
-    n_ghost = cell_imap.num_ghosts
-
-    # IMPORTANT: include ghosts for correct evaluation/assembly on shared facets
-    local_cells = np.arange(n_local + n_ghost, dtype=np.int32)
-    global_cells = cell_imap.local_to_global(local_cells)
-
-    fiber_functions = {}
-    for full_name, global_arr in fiber_data.items():
-        short = full_name.replace("fiber_", "")
-        f = fem.Function(DG0v, name=full_name)
-
-        # Subset the global array by the (owned+ghost) global cell ids
-        local_arr = global_arr[global_cells]  # shape (n_local+n_ghost, 3)
-
-        # DG0 vector dof layout is flat [x0,y0,z0, x1,y1,z1, ...]
-        f.x.array[: 3 * (n_local + n_ghost)] = local_arr.astype(np.float64).reshape(-1)
-        f.x.scatter_forward()
-
-        fiber_functions[short] = f
-        if rank == 0:
-            print(f"Created DG0 vector field: '{short}'")
-    return fiber_functions
-
-
-def constituent_C_elastic(C, Ginv):
-    """C^alpha = G^{-T} C G^{-1}. Here Ginv is symmetric, so G^{-T}=G^{-1}=Ginv."""
-    return Ginv * C * Ginv
-
-
-def read_mesh(path):
-    """Read mesh from XDMF file."""
-    if path.endswith(".msh"):
-        # from dolfinx.io import gmshio
-        domain, _ = io.gmsh.read_from_msh(path, MPI.COMM_WORLD, gdim=3)
-        return domain
-    
-    comm = MPI.COMM_WORLD
-    with io.XDMFFile(comm, path, "r") as xdmf:
-        domain = xdmf.read_mesh(name="Grid", ghost_mode=mesh.GhostMode.shared_facet)
-    return domain
-
-
-def read_meshtags(path, domain):
-    """Read meshtags from XDMF file."""
-    if path.endswith(".msh"):
-        from dolfinx.io import gmshio
-        _, meshtags = gmshio.read_meshtags_from_msh(path, domain, MPI.COMM_WORLD)
-        return meshtags
-    
-    comm = MPI.COMM_WORLD
-    with io.XDMFFile(comm, path, "r") as xdmf:
-        meshtags = xdmf.read_meshtags(domain, name="Grid")
-    return meshtags
-
-def read_fiber_data(path, comm):
-    """Read fiber data from XDMF/H5 file."""
-    if path.endswith(".msh"):
-        from dolfinx.io import gmshio
-        fiber_data = gmshio.read_cell_vector_fields_from_msh(path, comm)
-        return fiber_data
-    
-    fiber_data = read_cell_vector_fields_from_xdmf_h5(path, comm)
-    return fiber_data
-
-
-# -----------------------------------------------------------------------------
-# Load mesh + tags + fibers
-# -----------------------------------------------------------------------------
 
 comm = MPI.COMM_WORLD
 rank = comm.rank
 
-# mesh_file = "tube_mesh.xdmf"
-# # mesh_file = "tube_mesh.msh"
-# domain = read_mesh(mesh_file)
 
-
-
-
-from tube_mesh_vol2 import tube_mesh_to_dolfinx_model, generate_tube_volume_mesh
+# -----------------------------------------------------------------------------
+# Read mesh, boundary tags, fiber data
+# -----------------------------------------------------------------------------
 
 alpha0_deg = 29.91  # degrees
 alpha0 = alpha0_deg * np.pi / 180.0  # radians
@@ -236,62 +91,30 @@ domain = model.mesh
 facet_tags = model.facet_tags
 fiber_functions = model.fibers
 
+# Mesh
+# mesh_file = "tube_mesh.xdmf"
+# domain = read_mesh(mesh_file)
+
+# # Boundary facet tags
+# boundary_file = "tube_mesh_boundary.xdmf"
+# facet_tags = read_meshtags(boundary_file,domain)
+
+# # Fiber/basis data (DG0 vectors on cells)
+# fiber_file = "tube_mesh_fibers.xdmf"
+# fiber_data = build_DG0_vector_functions(domain, fiber_file, comm)
 
 
 
-
-
+elem_order = domain.geometry.cmap.degree
+dim = domain.geometry.dim
 tdim = domain.topology.dim
 fdim = tdim - 1
 domain.topology.create_connectivity(fdim, tdim)
-
-# # Boundary facet tags
-# facet_tags = None
-# boundary_file = "tube_mesh_boundary.xdmf"
-# # boundary_file = "tube_mesh_boundary.msh"
-# try:
-#     facet_tags = read_meshtags(boundary_file, domain)
-#     if rank == 0:
-#         print(f"Loaded facet tags from {boundary_file}; unique tags: {np.unique(facet_tags.values)}")
-# except Exception as e:
-#     if rank == 0:
-#         print(f"WARNING: Could not read boundary tags: {e}")
-#         print("         Proceeding without tags will fail unless you add geometric markers.")
-
-# # Fiber/basis data (DG0 vectors on cells)
-# fiber_functions = {}
-# fiber_file = "tube_mesh_fibers.xdmf"
-# # fiber_file = "tube_mesh_fibers.msh"
-# try:
-#     fiber_data = read_fiber_data(fiber_file, comm)
-#     fiber_functions = build_DG0_vector_functions(domain, fiber_data)
-# except Exception as e:
-#     if rank == 0:
-#         print(f"WARNING: Could not read fiber data: {e}")
-#         print("         Will use analytic cylindrical fallback directions.")
-
-
-# -----------------------------------------------------------------------------
-# Function spaces and kinematics
-# -----------------------------------------------------------------------------
-
-dim = domain.geometry.dim
-elem_order = domain.geometry.cmap.degree
-
-V = fem.functionspace(domain, ("Lagrange", elem_order, (dim,)))
-u = fem.Function(V, name="u")
-v = ufl.TestFunction(V)
-
-I = ufl.Identity(dim)
-F = I + ufl.grad(u)
-C = F.T * F
-J = ufl.det(F)
 
 
 # -----------------------------------------------------------------------------
 # Material parameters (Table 1, kPa -> N/mm^2)
 # -----------------------------------------------------------------------------
-# FIX 1: convert from kPa directly (do NOT multiply by 1e3 then 1e-3)
 
 kPa_to_N_per_mm2 = 1e-3  # 1 kPa = 1e-3 N/mm^2
 
@@ -325,15 +148,49 @@ Gc = fem.Constant(domain, PETSc.ScalarType(1.130))
 Ge_theta = fem.Constant(domain, PETSc.ScalarType(1.100))
 Ge_z     = fem.Constant(domain, PETSc.ScalarType(1.720))
 Ge_r     = fem.Constant(domain, PETSc.ScalarType(1.0 / (float(Ge_theta.value) * float(Ge_z.value))))
-# NOTE: For volumetric-preserving elastin prestretch you want Ge_r*Ge_theta*Ge_z = 1.
-# If you want exactly that, keep Ge_r = 1/(Ge_theta*Ge_z). If you prefer the paper's implied form,
-# you can set Ge_r = 1.0 and accept a small volume change in G (not recommended).
 
 # FIX 5: bulk-like penalty: kappa = 1e3*c_e (paper)
 kappa = fem.Constant(domain, PETSc.ScalarType(1e1 * float(c_e.value)))
 
 # Pre-Jacobian shift JG = exp(-p0/kappa) (paper Stage I)
 JG = fem.Constant(domain, PETSc.ScalarType(np.exp(-float(p0.value) / float(kappa.value))))
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def _normalize(v, eps=1e-12):
+    """UFL-safe normalization with a small epsilon."""
+    eps_ufl = ufl.as_ufl(eps)
+    return v / ufl.sqrt(ufl.dot(v, v) + eps_ufl)
+
+
+def cylindrical_basis(X):
+    """
+    Analytic cylindrical basis (axis = global z) computed from SpatialCoordinate.
+    Used as robust fallback if basis vectors are not found in the fiber file.
+    """
+    x, y, z = X[0], X[1], X[2]
+    r = ufl.sqrt(x*x + y*y + 1e-16)
+    e_r = ufl.as_vector((x/r, y/r, 0.0))
+    e_theta = ufl.as_vector((-y/r, x/r, 0.0))
+    e_z = ufl.as_vector((0.0, 0.0, 1.0))
+    return e_r, e_theta, e_z
+
+
+# -----------------------------------------------------------------------------
+# Function spaces and kinematics
+# -----------------------------------------------------------------------------
+
+V = fem.functionspace(domain, ("Lagrange", elem_order, (dim,)))
+u = fem.Function(V, name="u")
+v = ufl.TestFunction(V)
+
+I = ufl.Identity(dim)
+F = I + ufl.grad(u)
+C = F.T * F
+J = ufl.det(F)
 
 
 # -----------------------------------------------------------------------------
@@ -371,9 +228,10 @@ Ge_inv = (ufl.outer(e_r, e_r) / Ge_r +
 Gm_inv = (1.0 / Gm) * I
 Gc_inv = (1.0 / Gc) * I
 
-Ce = constituent_C_elastic(C, Ge_inv)
-Cm = constituent_C_elastic(C, Gm_inv)
-Cc = constituent_C_elastic(C, Gc_inv)
+# C^alpha = G^{-T} C G^{-1}. Here Ginv is symmetric, so G^{-T}=G^{-1}=Ginv
+Ce = Ge_inv * C * Ge_inv
+Cm = Gm_inv * C * Gm_inv
+Cc = Gc_inv * C * Gc_inv
 
 
 # -----------------------------------------------------------------------------
@@ -430,7 +288,7 @@ ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
 n = ufl.FacetNormal(domain)
 
 # FIX 2: traction = -P0*n on inner surface (tag 1)
-traction_inner = -P0 * n
+traction_inner = P0 * n
 R = ufl.derivative(W_total * dx, u, v) - ufl.dot(traction_inner, v) * ds(1)
 J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
 
@@ -438,9 +296,6 @@ J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
 # -----------------------------------------------------------------------------
 # Boundary conditions
 # -----------------------------------------------------------------------------
-
-# FIX 3: only constrain axial displacement (u_z) on end caps (tags 3 and 4), not full vector.
-# Also add minimal constraints on one end to prevent rigid-body translation in x/y.
 
 # Subspaces for components
 Vx = V.sub(0)  # x component
@@ -473,32 +328,6 @@ bcs = [bc_end1_x, bc_end1_y, bc_end1_z, bc_end2_x, bc_end2_y, bc_end2_z]
 # -----------------------------------------------------------------------------
 # Solve nonlinear problem (Stage I)
 # -----------------------------------------------------------------------------
-
-# petsc_options = {
-#     "snes_rtol": 1e-8,
-#     "snes_atol": 1e-9,
-#     "snes_max_it": 25,
-#     "snes_monitor": None,
-#     "snes_error_if_not_converged": True,
-#     "ksp_type": "gmres",
-#     "ksp_error_if_not_converged": True,
-#     "pc_type": "hypre",
-#     "pc_hypre_type": "boomeramg",
-# }
-
-# petsc_options = {
-#     "snes_rtol": 1e-5,
-#     "snes_atol": 1e-5,
-#     "snes_max_it": 150,
-#     "snes_monitor": None,
-#     "snes_error_if_not_converged": True,
-#     "snes_linesearch_type": "bt",   # backtracking
-#     "snes_linesearch_monitor": None,
-#     "ksp_type": "preonly",
-#     "pc_type": "lu",
-#     # Uncomment if you have MUMPS:
-#     # "pc_factor_mat_solver_type": "mumps",
-# }
 
 petsc_options = {
     # SNES (Nonlinear Solver) Options for Newton stepping
@@ -552,6 +381,11 @@ minutes = int((total_seconds % 3600) // 60)
 seconds = int(total_seconds % 60)
 print(f"Stage I solve time: {hours} hours, {minutes} minutes, {seconds} seconds")
 print(f"  Time per DOF: {(t2-t1)/(V.dofmap.index_map.size_global * V.dofmap.index_map_bs)*1e6:.2f} μs")
+
+
+# -----------------------------------------------------------------------------
+# Post-processing: displacements
+# -----------------------------------------------------------------------------
 
 # Calculate displacement components
 V_out = fem.functionspace(domain, ("Lagrange", elem_order, (dim,)))
