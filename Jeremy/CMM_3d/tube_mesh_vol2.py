@@ -575,7 +575,80 @@ def tube_mesh_to_dolfinx_model(
     return DolfinxTubeModel(mesh=domain, cell_tags=cell_tags, facet_tags=facet_tags, fibers=fibers_out)
 
 
-
+def plot_surface_normals(mesh_dict: Dict[str, Any], scale: float = 0.2, show_mesh: bool = True):
+    """
+    Plot surface normals for boundary faces using PyVista.
+    
+    Parameters
+    ----------
+    mesh_dict : dict
+        Output dictionary from generate_tube_volume_mesh containing:
+        - 'nodes': nodal coordinates
+        - 'boundary_faces': boundary face connectivity
+        - 'boundary_tags': tags identifying different boundary regions
+        - 'element_type': type of elements in the mesh
+    scale : float, optional
+        Scaling factor for normal arrow length, by default 0.2
+    show_mesh : bool, optional
+        Whether to show the mesh surface in addition to normals, by default True
+    """
+    nodes = mesh_dict["nodes"]
+    boundary_faces = mesh_dict["boundary_faces"]
+    boundary_tags = mesh_dict["boundary_tags"]
+    element_type = mesh_dict["element_type"]
+    
+    # Determine face type from element type
+    is_tri = element_type.startswith("tet")
+    
+    # Create PyVista mesh for boundary
+    if is_tri:
+        # Triangle faces
+        cells = boundary_faces
+        grid = pv.PolyData(nodes, faces=np.hstack([np.full((cells.shape[0], 1), 3), cells]))
+    else:
+        # Quad faces
+        cells = boundary_faces
+        grid = pv.PolyData(nodes, faces=np.hstack([np.full((cells.shape[0], 1), 4), cells]))
+    
+    # Add boundary tags as cell data
+    grid.cell_data["boundary_tags"] = boundary_tags
+    
+    # Compute surface normals
+    grid = grid.compute_normals(cell_normals=True, point_normals=False)
+    
+    # Get face centers for arrow positioning
+    face_centers = grid.cell_centers().points
+    
+    # Create point cloud at face centers with normal vectors
+    normal_cloud = pv.PolyData(face_centers)
+    normal_cloud["normals"] = grid.cell_data["Normals"]
+    
+    # Create arrow glyphs for normals
+    arrows = normal_cloud.glyph(
+        orient="normals",
+        scale=False,
+        factor=scale,
+        geom=pv.Arrow()
+    )
+    
+    # Create plotter
+    plotter = pv.Plotter()
+    
+    # Add boundary mesh if requested
+    if show_mesh:
+        plotter.add_mesh(grid, scalars="boundary_tags", show_edges=True, 
+                        opacity=0.7, cmap="viridis", label="Boundary")
+    
+    # Add normal arrows colored by boundary tag
+    if isinstance(arrows, pv.PolyData):
+        # Map boundary tags to arrow cells (each face center has one arrow)
+        arrow_tags = np.repeat(boundary_tags, arrows.n_cells // len(boundary_tags))
+        arrows.cell_data["boundary_tags"] = arrow_tags[:arrows.n_cells]
+        plotter.add_mesh(arrows, scalars="boundary_tags", cmap="viridis", 
+                        label="Surface Normals")
+    
+    plotter.add_axes()
+    plotter.show()
 
 
 

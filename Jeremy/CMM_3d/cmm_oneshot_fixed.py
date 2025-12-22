@@ -54,7 +54,7 @@ from dolfinx.plot import vtk_mesh
 from petsc4py import PETSc
 import pyvista as pv
 
-from tube_mesh_vol2 import tube_mesh_to_dolfinx_model, generate_tube_volume_mesh
+from tube_mesh_vol2 import tube_mesh_to_dolfinx_model, generate_tube_volume_mesh, plot_surface_normals
 
 
 comm = MPI.COMM_WORLD
@@ -68,7 +68,7 @@ rank = comm.rank
 alpha0_deg = 29.91  # degrees
 alpha0 = alpha0_deg * np.pi / 180.0  # radians
 
-mesh = generate_tube_volume_mesh(
+vmesh = generate_tube_volume_mesh(
     axial_length=10.0, # [mm]
     lumen_diameter=1.294, # [mm]
     wall_thickness=0.25, # [mm]
@@ -85,7 +85,7 @@ mesh = generate_tube_volume_mesh(
     },
 )
 
-model = tube_mesh_to_dolfinx_model(mesh)
+model = tube_mesh_to_dolfinx_model(vmesh)
 
 domain = model.mesh
 facet_tags = model.facet_tags
@@ -165,7 +165,6 @@ def _normalize(v, eps=1e-12):
     eps_ufl = ufl.as_ufl(eps)
     return v / ufl.sqrt(ufl.dot(v, v) + eps_ufl)
 
-
 def cylindrical_basis(X):
     """
     Analytic cylindrical basis (axis = global z) computed from SpatialCoordinate.
@@ -186,7 +185,11 @@ def cylindrical_basis(X):
 V = fem.functionspace(domain, ("Lagrange", elem_order, (dim,)))
 u = fem.Function(V, name="u")
 v = ufl.TestFunction(V)
+dx = ufl.Measure("dx", domain=domain)
+ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
+n = ufl.FacetNormal(domain)
 
+# Kinematics
 I = ufl.Identity(dim)
 F = I + ufl.grad(u)
 C = F.T * F
@@ -214,9 +217,10 @@ alpha0 = 29.91 * np.pi / 180.0
 a_diag1_fallback = _normalize(ufl.cos(alpha0) * e_z + ufl.sin(alpha0) * e_theta)
 a_diag2_fallback = _normalize(ufl.cos(alpha0) * e_z - ufl.sin(alpha0) * e_theta)
 
-a_diag1 = _normalize(fiber_functions.get("diagonal1", a_diag1_fallback))
-a_diag2 = _normalize(fiber_functions.get("diagonal2", a_diag2_fallback))
-
+# a_diag1 = _normalize(fiber_functions.get("diagonal1", a_diag1_fallback))
+# a_diag2 = _normalize(fiber_functions.get("diagonal2", a_diag2_fallback))
+a_diag1 = a_diag1_fallback
+a_diag2 = a_diag2_fallback
 
 # Elastin prestretch inverse tensor (anisotropic, volume-preserving by construction if Ge_r*Ge_theta*Ge_z=1)
 # Ginv = sum_i (e_i ⊗ e_i) / Ge_i
@@ -237,12 +241,10 @@ Cc = Gc_inv * C * Gc_inv
 # -----------------------------------------------------------------------------
 # Strain energy density (Stage I)
 # -----------------------------------------------------------------------------
-
 def W_elastin(Ce_):
     # Eq (51): W^e = c_e/2 (Ce:I - 3) 
     I1e = ufl.tr(Ce_)
     return 0.5 * c_e * (I1e - 3.0)
-
 
 def W_fiber(I4, c1, c2):
     """
@@ -253,17 +255,19 @@ def W_fiber(I4, c1, c2):
     # tension-only: no contribution in compression
     return ufl.conditional(ufl.gt(I4, 1.0), (c1 / (4.0 * c2)) * (ufl.exp(c2 * E * E) - 1.0), 0.0)
 
+def fiber_invariant(a_, C_):
+    """Helper to compute I4 = a . C . a"""
+    return ufl.dot(a_, C_ * a_)
 
 # Fiber invariants using constituent elastic C-tensors
-I4m = ufl.dot(a_theta, Cm * a_theta)     # SMC circumferential
-I4ct = ufl.dot(a_theta, Cc * a_theta)    # collagen circumferential
-I4cz = ufl.dot(a_axial, Cc * a_axial)    # collagen axial
-I4cd1 = ufl.dot(a_diag1, Cc * a_diag1)   # collagen diag +
-I4cd2 = ufl.dot(a_diag2, Cc * a_diag2)   # collagen diag -
-
+I4m = fiber_invariant(a_theta, Cm)     # SMC circumferential
 Wm = W_fiber(I4m, c1m, c2m)
 
 # collagen contribution (βd split equally between the two diagonal families)
+I4ct = fiber_invariant(a_theta, Cc)    # collagen circumferential
+I4cz = fiber_invariant(a_axial, Cc)    # collagen axial
+I4cd1 = fiber_invariant(a_diag1, Cc)   # collagen diag +
+I4cd2 = fiber_invariant(a_diag2, Cc)   # collagen diag -
 Wc = (beta_theta * W_fiber(I4ct, c1c, c2c) +
       beta_z     * W_fiber(I4cz, c1c, c2c) +
       0.5 * beta_d * (W_fiber(I4cd1, c1c, c2c) + W_fiber(I4cd2, c1c, c2c)))
@@ -272,23 +276,20 @@ Wc = (beta_theta * W_fiber(I4ct, c1c, c2c) +
 lnJ = ufl.ln(J * JG)
 U_vol = 0.5 * kappa * lnJ * lnJ
 
-W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
+# W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
+W_total = 0.5 * W_elastin(Ce) + 0.5 * Wm + U_vol
+# W_total = Wm # + U_vol
+# W_total = Wc # + U_vol
 
 
 # -----------------------------------------------------------------------------
 # Weak form: residual and Jacobian
 # -----------------------------------------------------------------------------
 
-dx = ufl.Measure("dx", domain=domain)
 
-if facet_tags is None:
-    raise RuntimeError("Facet tags are required (tube_mesh_boundary.xdmf).")
-
-ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
-n = ufl.FacetNormal(domain)
 
 # FIX 2: traction = -P0*n on inner surface (tag 1)
-traction_inner = P0 * n
+traction_inner = -P0 * n
 R = ufl.derivative(W_total * dx, u, v) - ufl.dot(traction_inner, v) * ds(1)
 J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
 
@@ -335,7 +336,7 @@ petsc_options = {
     "snes_atol": 1e-5, # Stop when the absolute residual drops below 10⁻⁹ (i.e., residual norm < 0.000000001)
     "snes_max_it": 250, # Maximum nonlinear iterations before giving up
     "snes_monitor": None, # Print residual norm at each iteration (helps debug convergence)
-    "snes_error_if_not_converged": False, # Raise error if not converged
+    "snes_error_if_not_converged": True, # Raise error if not converged
     "snes_linesearch_type": "bt",   # Use backtracking line search to ensure Newton steps decrease the residual
     "snes_linesearch_monitor": None, # Print line search details at each step
     
