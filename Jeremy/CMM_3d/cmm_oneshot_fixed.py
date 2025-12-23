@@ -270,6 +270,7 @@ def W_fiber(I4, c1, c2):
     return W_tension
     # return ufl.conditional(ufl.gt(E4, 0.0), W_tension, 0.0)
 
+
 # Neo-Hookean strain energy density
 # W = (μ/2)(I₁ - 3) + (κ/2)(ln J)²
 def W_neohookean(I1, J, mu, kappa):
@@ -278,32 +279,99 @@ def W_neohookean(I1, J, mu, kappa):
     W_total = W_iso + W_vol
     return W_total
 
+
 def fiber_invariant(a_, C_):
     """Helper to compute I4 = a . C . a"""
     return ufl.dot(a_, ufl.dot(C_, a_))
 
-# Fiber invariants using constituent elastic C-tensors
-I4m = fiber_invariant(a_theta, Cm)     # SMC circumferential
-Wm = W_fiber(I4m, c1m, c2m)
 
-# collagen contribution (βd split equally between the two diagonal families)
-I4ct = fiber_invariant(a_theta, Cc)    # collagen circumferential
-I4cz = fiber_invariant(a_axial, Cc)    # collagen axial
-I4cd1 = fiber_invariant(a_diag1, Cc)   # collagen diag +
-I4cd2 = fiber_invariant(a_diag2, Cc)   # collagen diag -
-Wc = (beta_theta * W_fiber(I4ct, c1c, c2c) +
-      beta_z     * W_fiber(I4cz, c1c, c2c) +
-      0.5 * beta_d * (W_fiber(I4cd1, c1c, c2c) + W_fiber(I4cd2, c1c, c2c)))
 
-# FIX 5: volumetric penalty uses ln(J*JG)
-# lnJ = ufl.ln(J * JG)
-# U_vol = 0.5 * kappa * lnJ * lnJ
+
+
+
+
+
+
+
+## TESTING HERE
+def prestretch_isochoric(a, g):
+    """
+    Build a symmetric, volume-preserving (det=1) prestretch tensor with
+    stretch g along direction a and 1/sqrt(g) in transverse directions.
+    This matches the paper's assumption that deposition tensors are symmetric
+    and volume-preserving. :contentReference[oaicite:3]{index=3}
+    """
+    I  = ufl.Identity(3)
+    aa = ufl.outer(a, a)
+    return g * aa + (1.0 / ufl.sqrt(g)) * (I - aa)
+
+
+def C_with_prestretch(C, G):
+    # general: Cα = (F G)^T (F G) = G^T C G
+    return G.T * C * G
+
+def fung_fiber_energy(C_xiN, a_xiN, c1, c2):
+    # Eq. (52): Ŵ^ξ = c1/(4 c2) * (exp(c2*(C:(a⊗a)-1)^2) - 1)
+    I4 = ufl.dot(a_xiN, ufl.dot(C_xiN, a_xiN))  # C:(a⊗a)
+    E  = I4 - 1.0
+    return (c1 / (4.0 * c2)) * (ufl.exp(c2 * E**2) - 1.0)
+
+# ---------- prestretch tensors ----------
+G_mN = prestretch_isochoric(a_theta, Gm)
+G_cN_th = prestretch_isochoric(a_theta, Gc)
+G_cN_z  = prestretch_isochoric(a_axial,  Gc)
+G_cN_d1 = prestretch_isochoric(a_diag1, Gc)
+G_cN_d2 = prestretch_isochoric(a_diag2, Gc)
+
+# ---------- constituent C-tensors ----------
+Ce = C_with_prestretch(C, Ge_inv)
+Cm = C_with_prestretch(C, G_mN)
+C_c_th = C_with_prestretch(C, G_cN_th)
+C_c_z  = C_with_prestretch(C, G_cN_z)
+C_c_d1 = C_with_prestretch(C, G_cN_d1)
+C_c_d2 = C_with_prestretch(C, G_cN_d2)
+
+# ---------- energies ----------
+# Eq. (51): Ŵ^e = (c_e/2)*(C_e:I - 3) :contentReference[oaicite:9]{index=9}
+W_e = 0.5 * c_e * (ufl.tr(Ce) - 3.0)
+
+# Eq. (52): fiber energies :contentReference[oaicite:10]{index=10}
+W_m = fung_fiber_energy(Cm, a_theta, c1m, c2m)
+
+W_c = (
+    beta_theta * fung_fiber_energy(C_c_th, a_theta, c1c, c2c)
+  + beta_z  * fung_fiber_energy(C_c_z,  a_axial,  c1c, c2c)
+  + 0.5 * beta_d * (fung_fiber_energy(C_c_d1, a_diag1, c1c, c2c)
+                + fung_fiber_energy(C_c_d2, a_diag2, c1c, c2c))
+)
+
 U_vol  = 0.5 * kappa * (ufl.ln(J))**2
 
-W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
-# W_total =  0.3 * W_elastin(Ce) + 0.7 * W_neohookean(ufl.tr(C), J, mu=c_e, kappa=kappa) + U_vol
-# W_total = Wm # + U_vol
-# W_total = Wc # + U_vol
+W_total = phi_e0 * W_e + phi_m0 * W_m + phi_c0 * W_c + U_vol
+
+
+# # Fiber invariants using constituent elastic C-tensors
+# I4m = fiber_invariant(a_theta, Cm)     # SMC circumferential
+# Wm = W_fiber(I4m, c1m, c2m)
+
+# # collagen contribution (βd split equally between the two diagonal families)
+# I4ct = fiber_invariant(a_theta, Cc)    # collagen circumferential
+# I4cz = fiber_invariant(a_axial, Cc)    # collagen axial
+# I4cd1 = fiber_invariant(a_diag1, Cc)   # collagen diag +
+# I4cd2 = fiber_invariant(a_diag2, Cc)   # collagen diag -
+# Wc = (beta_theta * W_fiber(I4ct, c1c, c2c) +
+#       beta_z     * W_fiber(I4cz, c1c, c2c) +
+#       0.5 * beta_d * (W_fiber(I4cd1, c1c, c2c) + W_fiber(I4cd2, c1c, c2c)))
+
+# # FIX 5: volumetric penalty uses ln(J*JG)
+# # lnJ = ufl.ln(J * JG)
+# # U_vol = 0.5 * kappa * lnJ * lnJ
+# U_vol  = 0.5 * kappa * (ufl.ln(J))**2
+
+# W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
+# # W_total =  0.3 * W_elastin(Ce) + 0.7 * W_neohookean(ufl.tr(C), J, mu=c_e, kappa=kappa) + U_vol
+# # W_total = Wm # + U_vol
+# # W_total = Wc # + U_vol
 
 
 # -----------------------------------------------------------------------------
@@ -318,7 +386,7 @@ W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
 # J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
 
 traction_inner = -P0 * J * FinvT * n
-R = ufl.derivative(W_total * dx, u, v) - ufl.dot(traction_inner, v) * ds(1)
+R = ufl.derivative(W_total * ufl.dx, u, v) - ufl.dot(traction_inner, v) * ds(1)
 J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
 
 # Pi = W_total * dx - P0 * ufl.dot(u, n) * ds(1)
