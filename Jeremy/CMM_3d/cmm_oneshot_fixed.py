@@ -185,6 +185,7 @@ def cylindrical_basis(X):
 V = fem.functionspace(domain, ("Lagrange", elem_order, (dim,)))
 u = fem.Function(V, name="u")
 v = ufl.TestFunction(V)
+du = ufl.TrialFunction(V)
 dx = ufl.Measure("dx", domain=domain)
 ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
 n = ufl.FacetNormal(domain)
@@ -192,8 +193,9 @@ n = ufl.FacetNormal(domain)
 # Kinematics
 I = ufl.Identity(dim)
 F = I + ufl.grad(u)
-C = F.T * F
 J = ufl.det(F)
+FinvT = ufl.inv(F).T
+C = F.T * F
 
 
 # -----------------------------------------------------------------------------
@@ -217,16 +219,17 @@ alpha0 = 29.91 * np.pi / 180.0
 a_diag1_fallback = _normalize(ufl.cos(alpha0) * e_z + ufl.sin(alpha0) * e_theta)
 a_diag2_fallback = _normalize(ufl.cos(alpha0) * e_z - ufl.sin(alpha0) * e_theta)
 
-# a_diag1 = _normalize(fiber_functions.get("diagonal1", a_diag1_fallback))
-# a_diag2 = _normalize(fiber_functions.get("diagonal2", a_diag2_fallback))
-a_diag1 = a_diag1_fallback
-a_diag2 = a_diag2_fallback
+a_diag1 = _normalize(fiber_functions.get("diagonal1", a_diag1_fallback))
+a_diag2 = _normalize(fiber_functions.get("diagonal2", a_diag2_fallback))
 
 # Elastin prestretch inverse tensor (anisotropic, volume-preserving by construction if Ge_r*Ge_theta*Ge_z=1)
 # Ginv = sum_i (e_i ⊗ e_i) / Ge_i
-Ge_inv = (ufl.outer(e_r, e_r) / Ge_r +
-          ufl.outer(e_theta, e_theta) / Ge_theta +
-          ufl.outer(e_z, e_z) / Ge_z)
+# Ge_inv = (ufl.outer(e_r, e_r) / Ge_r +
+#           ufl.outer(e_theta, e_theta) / Ge_theta +
+#           ufl.outer(e_z, e_z) / Ge_z)
+Ge_inv = (Ge_r * ufl.outer(e_r, e_r) +
+          Ge_theta * ufl.outer(e_theta, e_theta) +
+          Ge_z * ufl.outer(e_z, e_z))
 
 # SMC + collagen prestretch inverse tensors (isotropic)
 Gm_inv = (1.0 / Gm) * I
@@ -238,13 +241,14 @@ Cm = Gm_inv * C * Gm_inv
 Cc = Gc_inv * C * Gc_inv
 
 
+
 # -----------------------------------------------------------------------------
 # Strain energy density (Stage I)
 # -----------------------------------------------------------------------------
 def W_elastin(Ce_):
     # Eq (51): W^e = c_e/2 (Ce:I - 3) 
-    I1e = ufl.tr(Ce_)
-    return 0.5 * c_e * (I1e - 3.0)
+    # I1e = ufl.tr(Ce_)
+    return 0.5 * c_e * (ufl.tr(Ce_) - 3.0)
 
 def W_fiber(I4, c1, c2):
     """
@@ -262,8 +266,9 @@ def W_fiber(I4, c1, c2):
     """
     E4 = I4 - 1.0  # Green strain in fiber direction
     # Tension-only: fibers only resist stretch (E4 > 0 ⟺ I4 > 1)
-    W_tension = (c1 / (4.0 * c2)) * (ufl.exp(c2 * E4 * E4) - 1.0)
-    return ufl.conditional(ufl.gt(E4, 0.0), W_tension, 0.0)
+    W_tension = (c1 / (4.0 * c2)) * (ufl.exp(c2 * E4**2) - 1.0)
+    return W_tension
+    # return ufl.conditional(ufl.gt(E4, 0.0), W_tension, 0.0)
 
 # Neo-Hookean strain energy density
 # W = (μ/2)(I₁ - 3) + (κ/2)(ln J)²
@@ -275,7 +280,7 @@ def W_neohookean(I1, J, mu, kappa):
 
 def fiber_invariant(a_, C_):
     """Helper to compute I4 = a . C . a"""
-    return ufl.dot(a_, C_ * a_)
+    return ufl.dot(a_, ufl.dot(C_, a_))
 
 # Fiber invariants using constituent elastic C-tensors
 I4m = fiber_invariant(a_theta, Cm)     # SMC circumferential
@@ -291,8 +296,9 @@ Wc = (beta_theta * W_fiber(I4ct, c1c, c2c) +
       0.5 * beta_d * (W_fiber(I4cd1, c1c, c2c) + W_fiber(I4cd2, c1c, c2c)))
 
 # FIX 5: volumetric penalty uses ln(J*JG)
-lnJ = ufl.ln(J * JG)
-U_vol = 0.5 * kappa * lnJ * lnJ
+# lnJ = ufl.ln(J * JG)
+# U_vol = 0.5 * kappa * lnJ * lnJ
+U_vol  = 0.5 * kappa * (ufl.ln(J))**2
 
 W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
 # W_total =  0.3 * W_elastin(Ce) + 0.7 * W_neohookean(ufl.tr(C), J, mu=c_e, kappa=kappa) + U_vol
@@ -307,9 +313,17 @@ W_total = phi_e0 * W_elastin(Ce) + phi_m0 * Wm + phi_c0 * Wc + U_vol
 
 
 # FIX 2: traction = -P0*n on inner surface (tag 1)
-traction_inner = -P0 * n
+# traction_inner = -P0 * n
+# R = ufl.derivative(W_total * dx, u, v) - ufl.dot(traction_inner, v) * ds(1)
+# J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
+
+traction_inner = -P0 * J * FinvT * n
 R = ufl.derivative(W_total * dx, u, v) - ufl.dot(traction_inner, v) * ds(1)
 J_form = ufl.derivative(R, u, ufl.TrialFunction(V))
+
+# Pi = W_total * dx - P0 * ufl.dot(u, n) * ds(1)
+# R = ufl.derivative(Pi, u, v)
+# J_form = ufl.derivative(R, u, du)
 
 
 # -----------------------------------------------------------------------------
